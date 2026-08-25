@@ -1,0 +1,25 @@
+# 数据表(太大,不进仓库;获取方式见 README)
+solver/tt/
+solver/tt*/
+*.npy
+*.dat
+*.zst
+*.tmp
+*.pkl
+
+# 构建产物
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec.bak
+
+# 本地软件包与分发资料(不上传)
+软件包/
+其他电脑游玩说明.txt
+
+# 运行日志与临时输出
+*_log.txt
+*.log
+dist_dbg.txt
+corridor_ckpt*.pkl
