@@ -122,8 +122,12 @@ def score_position(w, s, turn, eng=None, depth=6):
     return r
 
 
-def estimate(w, s, turn, ai_wolf, ai_sheep, depth=8, eng=None):
-    """返回 (p_wolf, p_sheep, p_draw)。turn=当前走子方。"""
+def estimate(w, s, turn, ai_wolf, ai_sheep, depth=8, eng=None, seen=None):
+    """返回 (p_wolf, p_sheep, p_draw)。turn=当前走子方。
+    - 已定局面(表值狼胜/羊胜)直接精确返回;
+    - 同一局面在路径中再次出现(循环)=按和棋折底,终止递归;
+    - depth 只是"最多算多深"的安全上限,不再是准确性硬顶
+      (迭代加深:深度越深越准,直到循环折底或已定局面)。"""
     # 终局
     if popcount(s) <= 3:
         return (1.0, 0.0, 0.0)
@@ -131,45 +135,56 @@ def estimate(w, s, turn, ai_wolf, ai_sheep, depth=8, eng=None):
         return (0.0, 1.0, 0.0)
     if turn == SHEEP and not sheep_moves(w, s):
         return (1.0, 0.0, 0.0)
+    # 已定局面:精确值(不再继续展开)
+    v = endgame.lookup(w, s, turn)
+    if v == WOLF_WIN:
+        return (1.0, 0.0, 0.0)
+    if v == SHEEP_WIN:
+        return (0.0, 1.0, 0.0)
+    if seen is None:
+        seen = set()
+    if (w, s, turn) in seen:
+        return (0.0, 0.0, 1.0)   # 路径循环:按和棋折底
     if depth <= 0:
-        v = endgame.lookup(w, s, turn)
-        if v == WOLF_WIN:
-            return (1.0, 0.0, 0.0)
-        if v == SHEEP_WIN:
-            return (0.0, 1.0, 0.0)
         return (0.0, 0.0, 1.0)
-    if turn == WOLF:
-        if ai_wolf and eng is not None:
-            mv = eng._choose_table_move(w, s, WOLF, fast=True)
-            if mv is None:
-                return (0.0, 0.0, 1.0)
-            return estimate(*apply_wolf_move(w, s, mv[0], mv[1]), SHEEP,
-                            ai_wolf, ai_sheep, depth - 1, eng)
-        dist = _human_dist(w, s, WOLF)
-        pw = ps_ = pd_ = 0.0
-        for m, pr in dist:
-            w2, s2 = apply_wolf_move(w, s, m[0], m[1])
-            if popcount(s2) <= 3:
-                pw += pr
-                continue
-            sub = estimate(w2, s2, SHEEP, ai_wolf, ai_sheep, depth - 1, eng)
-            pw += pr * sub[0]
-            ps_ += pr * sub[1]
-            pd_ += pr * sub[2]
-        return (pw, ps_, pd_)
-    else:
-        if ai_sheep and eng is not None:
-            mv = eng._choose_table_move(w, s, SHEEP, fast=True)
-            if mv is None:
-                return (0.0, 0.0, 1.0)
-            return estimate(*apply_sheep_move(w, s, mv[0], mv[1]), WOLF,
-                            ai_wolf, ai_sheep, depth - 1, eng)
-        dist = _human_dist(w, s, SHEEP)
-        pw = ps_ = pd_ = 0.0
-        for m, pr in dist:
-            w2, s2 = apply_sheep_move(w, s, m[0], m[1])
-            sub = estimate(w2, s2, WOLF, ai_wolf, ai_sheep, depth - 1, eng)
-            pw += pr * sub[0]
-            ps_ += pr * sub[1]
-            pd_ += pr * sub[2]
-        return (pw, ps_, pd_)
+    seen.add((w, s, turn))
+    try:
+        if turn == WOLF:
+            if ai_wolf and eng is not None:
+                mv = eng._choose_table_move(w, s, WOLF, fast=True)
+                if mv is None:
+                    return (0.0, 0.0, 1.0)
+                return estimate(*apply_wolf_move(w, s, mv[0], mv[1]), SHEEP,
+                                ai_wolf, ai_sheep, depth - 1, eng, seen)
+            dist = _human_dist(w, s, WOLF)
+            pw = ps_ = pd_ = 0.0
+            for m, pr in dist:
+                w2, s2 = apply_wolf_move(w, s, m[0], m[1])
+                if popcount(s2) <= 3:
+                    pw += pr
+                    continue
+                sub = estimate(w2, s2, SHEEP, ai_wolf, ai_sheep,
+                               depth - 1, eng, seen)
+                pw += pr * sub[0]
+                ps_ += pr * sub[1]
+                pd_ += pr * sub[2]
+            return (pw, ps_, pd_)
+        else:
+            if ai_sheep and eng is not None:
+                mv = eng._choose_table_move(w, s, SHEEP, fast=True)
+                if mv is None:
+                    return (0.0, 0.0, 1.0)
+                return estimate(*apply_sheep_move(w, s, mv[0], mv[1]), WOLF,
+                                ai_wolf, ai_sheep, depth - 1, eng, seen)
+            dist = _human_dist(w, s, SHEEP)
+            pw = ps_ = pd_ = 0.0
+            for m, pr in dist:
+                w2, s2 = apply_sheep_move(w, s, m[0], m[1])
+                sub = estimate(w2, s2, WOLF, ai_wolf, ai_sheep,
+                               depth - 1, eng, seen)
+                pw += pr * sub[0]
+                ps_ += pr * sub[1]
+                pd_ += pr * sub[2]
+            return (pw, ps_, pd_)
+    finally:
+        seen.discard((w, s, turn))

@@ -13,6 +13,43 @@ for k, moves in book.items():
     best = max(m[2] for m in moves)
     out[(w, s)] = [(m[0], m[1]) for m in moves if m[2] == best]
 
+
+def _mirror_pos(p):
+    return (p // 5) * 5 + (4 - p % 5)
+
+
+def _mirror_state(w, s):
+    mw = ms = 0
+    x = w
+    while x:
+        lsb = x & -x
+        mw |= 1 << _mirror_pos(lsb.bit_length() - 1)
+        x ^= lsb
+    x = s
+    while x:
+        lsb = x & -x
+        ms |= 1 << _mirror_pos(lsb.bit_length() - 1)
+        x ^= lsb
+    return mw, ms
+
+
+def _mirror_move(mv):
+    a, b = mv
+    return (_mirror_pos(a), _mirror_pos(b))
+
+
+# 镜像补全:5x5 棋盘左右对称(A<->E, B<->D),书必须两侧齐全
+added = 0
+for (w, s), ms in list(out.items()):
+    mw, mss = _mirror_state(w, s)
+    tgt = out.setdefault((mw, mss), [])
+    for mv in ms:
+        mmv = _mirror_move(mv)
+        if mmv not in tgt:
+            tgt.append(mmv)
+            added += 1
+print(f"主选书镜像补全: 新增 {added} 个走法,共 {len(out)} 个局面")
+
 lines = [
     "# -*- coding: utf-8 -*-",
     '"""高压走廊开局书(由 corridor_search.py / gen_book.py 生成)。',

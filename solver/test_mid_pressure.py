@@ -63,10 +63,8 @@ def sample_midgame(rng):
 
 
 def key4(eng, w, s, frm, to):
-    """(rep, bk, safe, wcorr) 前缀键,与引擎羊方和棋排序一致。
+    """(bk, safe, wcorr) 前缀键,与引擎羊方和棋排序(定稿)一致。
     bk: 0=主选书 1=次选书 2=常规。"""
-    w2, s2 = apply_sheep_move(w, s, frm, to)
-    rep = eng._wolf_can_repeat(w2, s2, set())
     bm = opening_book.BOOK.get((w, s))
     bm2 = opening_book2.BOOK2.get((w, s))
     if bm and (frm, to) in bm:
@@ -75,9 +73,10 @@ def key4(eng, w, s, frm, to):
         bk = 1
     else:
         bk = 2
+    w2, s2 = apply_sheep_move(w, s, frm, to)
     safe = eng._wolf_safe_caps(w2, s2)
     bad, tot = eng._opp_err(w2, s2, WOLF)
-    return (rep, bk, safe, tot - bad)
+    return (bk, safe, tot - bad)
 
 
 def main():
@@ -101,7 +100,7 @@ def main():
         best = min(key4(eng, w, s, a, b) for a, b in sdm)
         assert got == best, \
             f"键不一致: got={got} best={best} @ 羊{mv}"
-        if got[3] == 1:
+        if got[2] == 1:
             n_corr1 += 1
         n += 1
     print(f"中局精度压力: {n} 样本全部键一致 OK;"

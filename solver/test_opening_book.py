@@ -129,6 +129,35 @@ def main():
     assert (mv[0], mv[1]) in opening_book2.BOOK2[(w, s)], \
         f"引擎未选次选走法: {pos_name(mv[0])}→{pos_name(mv[1])}"
     print("引擎次选局面选次选走法 OK")
+
+    # 6) 镜像对称:每个书条目(主选/次选)的镜像局面存在且镜像走法齐全
+    def _mpos(p):
+        return (p // 5) * 5 + (4 - p % 5)
+
+    def _mstate(w, s):
+        mw = ms = 0
+        x = w
+        while x:
+            lsb = x & -x
+            mw |= 1 << _mpos(lsb.bit_length() - 1)
+            x ^= lsb
+        x = s
+        while x:
+            lsb = x & -x
+            ms |= 1 << _mpos(lsb.bit_length() - 1)
+            x ^= lsb
+        return mw, ms
+
+    for book, name in ((opening_book.BOOK, "主选"),
+                       (opening_book2.BOOK2, "次选")):
+        for (w, s), moves in book.items():
+            mw, mss = _mstate(w, s)
+            assert (mw, mss) in book, f"{name}书缺镜像局面"
+            tgt = book[(mw, mss)]
+            for a, b in moves:
+                assert (_mpos(a), _mpos(b)) in tgt, \
+                    f"{name}书缺镜像走法 {pos_name(a)}→{pos_name(b)}"
+    print("镜像对称检查: 主选/次选书全部 OK")
     print("RESULT: ALL OK")
 
 

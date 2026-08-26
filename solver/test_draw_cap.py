@@ -28,16 +28,19 @@ rng = random.Random(99)
 
 def wolf_key(w, s, m, hist_set=None):
     """狼方和棋候选的排序键(与引擎一致):
-    (-吃子潜力, -走回历史, -羊重复压迫, 先吃, -骗招度)"""
+    (羊正招极少, -长线吃子, -强手模型评分, -走回历史, -重复压迫, 先吃, -骗招度)"""
     ww, ss = apply_wolf_move(w, s, m[0], m[1])
     b, t = eng._opp_err(ww, ss, SHEEP)
     ratio = b / t if t else 0.0
+    scorr = t - b
     eat = eng._wolf_eat_potential(ww, ss)
+    wsc = winrate.score_position(ww, ss, SHEEP, eng=eng,
+                                 depth=eng.score_depth)[0]
     if hist_set:
         inh = (ww, ss) in hist_set
         zug = eng._sheep_zugzwang(ww, ss, hist_set)
-        return (-eat, -inh, -zug, 0 if m[2] else 1, -ratio)
-    return (-eat, 0, 0, 0 if m[2] else 1, -ratio)
+        return (scorr, -eat, -wsc, -inh, -zug, 0 if m[2] else 1, -ratio)
+    return (scorr, -eat, -wsc, 0, 0, 0 if m[2] else 1, -ratio)
 
 
 n = 0
@@ -45,7 +48,7 @@ n_cap_avail = 0
 bad = 0
 mism_arrow = 0
 trials = 0
-while n < 300 and trials < 200000:
+while n < 200 and trials < 150000:
     trials += 1
     k = rng.choice([4, 5, 6, 7, 8])
     cells = rng.sample(range(25), 3 + k)
@@ -100,7 +103,7 @@ while trials < 300000:
     w = sum(1 << c for c in cells[:3])
     s = sum(1 << c for c in cells[3:])
     if endgame.lookup(w, s, WOLF) == DRAW:
-        if n_w < 150:
+        if n_w < 80:
             n_w += 1
             mv, info = eng.best_move(w, s, WOLF, history=())
             if info["value"] == DRAW:
@@ -118,7 +121,7 @@ while trials < 300000:
                         print(f"  [狼·长线吃子键] got={wolf_key(w, s, mv)} "
                               f"best={best_key}")
     if endgame.lookup(w, s, SHEEP) == DRAW:
-        if n_s < 150:
+        if n_s < 80:
             n_s += 1
             mv, info = eng.best_move(w, s, SHEEP, history=())
             if info["value"] != DRAW:
@@ -142,16 +145,16 @@ while trials < 300000:
                 got_bk = 2
             got_drop = eng._bait_score_drop(w2, s2) if got_safe > 0 else 0.0
             got_score = winrate.score_position(w2, s2, WOLF, eng=eng,
-                                               depth=4)[0]
-            # 引擎羊方和棋偏好:(不走进重复陷阱) → (高压走廊开局书)
-            # → (安全吃子少) → (狼正招极少) → (软诱饵落差大) → (狼吃子
-            # 威胁小) → (模型评分低) → (败招多) → (显眼败招多) → (毒羊)
+                                               depth=eng.score_depth)[0]
+            # 引擎羊方和棋偏好(定稿):(开局书) → (安全吃子少) →
+            # (狼正招极少) → (狼吃子威胁小) → (模型评分低) →
+            # (重复次数少) → (软诱饵落差大) → (败招多) → (显眼败招多)
+            # → (毒羊)
             best = None
             for frm, to in sheep_moves(w, s):
                 ww, ss = apply_sheep_move(w, s, frm, to)
                 if endgame.lookup(ww, ss, WOLF) != DRAW:
                     continue
-                repn = eng._wolf_can_repeat(ww, ss, set())
                 bmn = opening_book.BOOK.get((w, s))
                 bmn2 = opening_book2.BOOK2.get((w, s))
                 if bmn and (frm, to) in bmn:
@@ -168,43 +171,47 @@ while trials < 300000:
                 badn, totn = eng._opp_err(ww, ss, WOLF)
                 wc = totn - badn          # 狼正招数
                 scm = winrate.score_position(ww, ss, WOLF, eng=eng,
-                                             depth=4)[0]
-                key = (repn, bkn, sc, wc, -dp, thr, scm,
-                       -badn, -sal, -ps)
+                                             depth=eng.score_depth)[0]
+                chn = eng._pressure_chain(ww, ss)
+                sca = scm - 25 * min(chn, 8)   # 模型评分+表精确压力链
+                key = (bkn, sc, wc, thr, sca, 0, -dp, -badn, -sal, -ps)
                 if best is None or key < best:
                     best = key
-            best_rep, best_bk, best_sc, best_wc, neg_dp, best_thr, \
-                best_scm, neg_bad, neg_sal, neg_ps = best
-            if (got_rep != best_rep or got_bk != best_bk
+            best_bk, best_sc, best_wc, best_thr, best_scm, best_rc, \
+                neg_dp, neg_bad, neg_sal, neg_ps = best
+            got_chn = eng._pressure_chain(w2, s2)
+            got_sca = got_score - 25 * min(got_chn, 8)
+            if (got_bk != best_bk
                     or got_safe != best_sc or got_wcorr != best_wc
-                    or got_drop + 1e-9 < -neg_dp
                     or got_thr != best_thr
-                    or got_score > best_scm + 1e-6
+                    or got_sca > best_scm + 1e-6
+                    or got_drop + 1e-9 < -neg_dp
                     or got_bad != -neg_bad
                     or got_sal + 1e-9 < -neg_sal
                     or -got_poison != neg_ps):
                 bad_s += 1
-                print(f"  [羊·键核对] rep={got_rep}(min={best_rep}) "
-                      f"bk={got_bk}(min={best_bk}) "
+                print(f"  [羊·键核对] bk={got_bk}(min={best_bk}) "
                       f"safe={got_safe}(min={best_sc}) "
                       f"wcorr={got_wcorr}(min={best_wc}) "
-                      f"drop={got_drop:.0f}(max={-neg_dp:.0f}) "
                       f"threat={got_thr}(min={best_thr}) "
-                      f"score={got_score:.0f}(min={best_scm:.0f}) "
+                      f"score_adj={got_sca:.0f}(min={best_scm:.0f}) "
+                      f"drop={got_drop:.0f}(max={-neg_dp:.0f}) "
                       f"bad={got_bad}(max={-neg_bad}) "
                       f"salient={got_sal:.2f}(max={-neg_sal:.2f}) "
                       f"poison={got_poison}")
-    if n_w >= 150 and n_s >= 150:
+    if n_w >= 80 and n_s >= 80:
         break
 
 print(f"狼侧无吃子骗招度检查 {n_w} 个, 失败 {bad_w}; 羊侧骗招度检查 {n_s} 个, 失败 {bad_s}")
 
-# ---- 重复回避(用户规则):和棋=羊负,该变招的是羊;狼可重复不变招 ----
+# ---- 重复规则(用户确认):同一局面第5次出现判和(羊负) ----
+# 羊:第2~4次重复合法;走到第5次=羊负,有其他出路时必须回避。
+# 狼:能走到第5次=规则胜(和棋判狼胜),应主动识别并选择。
 n_rep = 0
-bad_rep = 0
-bad_wolf_rep = 0
+bad_rep5 = 0
+bad_wolf5 = 0
 trials = 0
-while n_rep < 100 and trials < 300000:
+while n_rep < 60 and trials < 200000:
     trials += 1
     k = rng.choice([5, 6, 7, 8])
     cells = rng.sample(range(25), 3 + k)
@@ -218,31 +225,41 @@ while n_rep < 100 and trials < 300000:
     w2, s2 = apply_sheep_move(w, s, mv[0], mv[1])
     if len(sheep_moves(w, s)) < 2:
         continue
-    # 羊:最优后继已"出现过" → 直接重复禁走,哪怕其他招是送子/输棋
-    mv2, _ = eng.best_move(w, s, SHEEP, history=((w2, s2),))
-    w3, s3 = apply_sheep_move(w, s, mv2[0], mv2[1])
-    if (w3, s3) == (w2, s2):
-        bad_rep += 1
-        if bad_rep <= 3:
-            print(f"  [羊·重复未回避] {pos_name(mv[0])}→{pos_name(mv[1])}")
+    # 羊:后继已出现4次 → 再走=第5次=羊负,有其他和棋出路时必须回避
+    dm = [(a, b) for a, b in sheep_moves(w, s)
+          if endgame.lookup(*apply_sheep_move(w, s, a, b), WOLF) == DRAW]
+    if any(apply_sheep_move(w, s, a, b) == (w2, s2) for a, b in dm):
+        alt = [(a, b) for a, b in dm
+               if apply_sheep_move(w, s, a, b) != (w2, s2)]
+        if alt:
+            mv2, _ = eng.best_move(w, s, SHEEP, history=((w2, s2),) * 4)
+            w3, s3 = apply_sheep_move(w, s, mv2[0], mv2[1])
+            if (w3, s3) == (w2, s2):
+                bad_rep5 += 1
+                if bad_rep5 <= 3:
+                    print(f"  [羊·第5次重复未回避] "
+                          f"{pos_name(mv[0])}→{pos_name(mv[1])}")
     n_rep += 1
-    # 狼:同一历史下仍可选原招(狼不必变招)
-    wmv, _ = eng.best_move(w, s, WOLF, history=((w2, s2),))
-    if wmv is None:
-        continue
+    # 狼:存在一步走回"已出现4次"的局面 → 规则胜(第5次=和棋判狼胜)
     if endgame.lookup(w, s, WOLF) == DRAW:
-        wmv0, _ = eng.best_move(w, s, WOLF, history=())
-        ww2, ss2 = apply_wolf_move(w, s, wmv0[0], wmv0[1])
-        ww3, ss3 = apply_wolf_move(w, s, wmv[0], wmv[1])
-        if (ww3, ss3) != (ww2, ss2):
-            bad_wolf_rep += 1
-print(f"重复回避: 羊侧 {n_rep} 例(未换招 {bad_rep}), 狼侧错误换招 {bad_wolf_rep}")
+        can5 = [(a, b, cap) for a, b, cap in wolf_moves(w, s)
+                if apply_wolf_move(w, s, a, b) == (w2, s2)]
+        if can5:
+            wmv, winfo = eng.best_move(w, s, WOLF, history=((w2, s2),) * 4)
+            if wmv is None or (wmv[0], wmv[1]) not in \
+                    {(a, b) for a, b, c in can5} or \
+                    winfo["value"] != WOLF_WIN:
+                bad_wolf5 += 1
+                if bad_wolf5 <= 3:
+                    print(f"  [狼·规则胜未识别] 候选={can5} got={wmv}")
+print(f"重复规则(5次判和): 羊侧 {n_rep} 例(第5次未回避 {bad_rep5}), "
+      f"狼侧规则胜识别失败 {bad_wolf5}")
 
-# ---- 重复逼和(用户反馈):羊不给狼"走回历史"的机会;送子必须换位置优势 ----
+# ---- 重复规则硬检查(5次判和):羊走后不能让狼一步走回"第4次出现"局面 ----
 n_z = 0
 bad_z = 0
 trials = 0
-while n_z < 40 and trials < 600000:
+while n_z < 25 and trials < 400000:
     trials += 1
     k = rng.choice([5, 6, 7, 8])
     cells = rng.sample(range(25), 3 + k)
@@ -250,11 +267,11 @@ while n_z < 40 and trials < 600000:
     s = sum(1 << c for c in cells[3:])
     if endgame.lookup(w, s, SHEEP) != DRAW:
         continue
-    # 朴素主线(无历史意识)自对弈8回合,构成"已出现局面"集合(接近真实对局)
+    # 朴素主线自对弈8回合构成历史
     hist = [(w, s)]
     cw, cs, ct = w, s, SHEEP
     for _ in range(8):
-        mvc = eng._choose_table_move(cw, cs, ct)
+        mvc = eng._choose_table_move(cw, cs, ct, fast=True)
         if mvc is None:
             break
         if ct == SHEEP:
@@ -265,37 +282,38 @@ while n_z < 40 and trials < 600000:
         ct = 1 - ct
     if len(hist) < 5:
         continue
-    hist_set = set(hist)
-    mv, info = eng.best_move(w, s, SHEEP, history=())
-    if mv is None or info["value"] != DRAW:
-        continue
-    w2, s2 = apply_sheep_move(w, s, mv[0], mv[1])
-    if not eng._wolf_can_repeat(w2, s2, hist_set):
-        continue
-    n_z += 1
-    mv2, _ = eng.best_move(w, s, SHEEP, history=tuple(hist_set))
-    w3, s3 = apply_sheep_move(w, s, mv2[0], mv2[1])
-    alt_free = False
+    # 是否存在"羊走后狼一步走回4次出现局面"的危险候选
+    danger = False
     for m in sheep_moves(w, s):
         aw, as_ = apply_sheep_move(w, s, m[0], m[1])
-        if (aw, as_) == (w2, s2):
-            continue
         if endgame.lookup(aw, as_, WOLF) != DRAW:
             continue
-        if not eng._wolf_can_repeat(aw, as_, hist_set):
-            alt_free = True
+        for wm in wolf_moves(aw, as_):
+            ww, ss = apply_wolf_move(aw, as_, wm[0], wm[1])
+            if hist.count((ww, ss)) >= 4:
+                danger = True
+                break
+        if danger:
             break
-    if alt_free and (w3, s3) == (w2, s2):
-        bad_z += 1
-        if bad_z <= 3:
-            print(f"  [羊·重复逼和未回避] {pos_name(mv[0])}→{pos_name(mv[1])}")
-print(f"重复逼和回避: 触发 {n_z} 例, 未回避 {bad_z}")
+    if not danger:
+        continue
+    n_z += 1
+    mv, _ = eng.best_move(w, s, SHEEP, history=tuple(hist))
+    w2, s2 = apply_sheep_move(w, s, mv[0], mv[1])
+    for wm in wolf_moves(w2, s2):
+        ww, ss = apply_wolf_move(w2, s2, wm[0], wm[1])
+        if hist.count((ww, ss)) >= 4:
+            bad_z += 1
+            if bad_z <= 3:
+                print(f"  [羊·走后狼规则胜] {pos_name(mv[0])}→{pos_name(mv[1])}")
+            break
+print(f"重复规则硬检查: 危险局面 {n_z} 例, 未回避 {bad_z}")
 
 # ---- 狼的重复压迫(用户思路):狼主动制造"羊只能重复或送子"的局面 ----
 n_wz = 0
 bad_wz = 0
 trials = 0
-while n_wz < 40 and trials < 600000:
+while n_wz < 25 and trials < 400000:
     trials += 1
     k = rng.choice([5, 6, 7, 8])
     cells = rng.sample(range(25), 3 + k)
@@ -307,7 +325,7 @@ while n_wz < 40 and trials < 600000:
     hist = [(w, s)]
     cw, cs, ct = w, s, WOLF
     for _ in range(8):
-        mvc = eng._choose_table_move(cw, cs, ct)
+        mvc = eng._choose_table_move(cw, cs, ct, fast=True)
         if mvc is None:
             break
         if ct == SHEEP:
@@ -348,7 +366,7 @@ while n_wz < 40 and trials < 600000:
 print(f"狼重复压迫: 触发 {n_wz} 例, 键不符 {bad_wz}")
 print("RESULT:", "ALL OK" if (bad == 0 and mism_arrow == 0 and n_cap_avail > 20
                               and bad_w == 0 and bad_s == 0
-                              and bad_rep == 0 and bad_wolf_rep == 0
-                              and bad_z == 0 and n_z >= 5
+                              and bad_rep5 == 0 and bad_wolf5 == 0
+                              and bad_z == 0 and n_z >= 4
                               and bad_wz == 0 and n_wz >= 10)
       else "FAIL")

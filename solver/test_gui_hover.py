@@ -110,5 +110,25 @@ assert game.hover_mv[:2] == game._book_cache[0][:2]
 game._clear_hover()
 assert game.hover_mv is None
 
+# 5b) 高压招法面板:书内局面的书内走法应出现在"走后对方唯一正招"栏
+assert game.press_list.size() >= 1, "高压招法面板应有内容"
+assert len(game._press_cache) >= 1
+game.on_press_hover(Ev(8, 8))
+assert game.hover_mv is not None, "高压招法悬停应产生预览箭头"
+game._clear_hover()
+assert game.hover_mv is None
+
+# 5c) 已定局面:分析箭头(数据层)与候选面板第一手必须一致
+game.restart()
+game.analysis = True                     # _refresh_analysis_now 需要分析开启
+w, s = apply_wolf_move(INIT_WOLVES, INIT_SHEEP, 1, 6)   # 狼开局败着 B5→B4
+game._commit(w, s, mv=(1, 6))
+game._refresh_panels()
+game._refresh_analysis_now()             # 同步计算分析箭头(与 GUI 同一数据路径)
+assert len(game._cand_cache) > 0, "已定局面候选面板应有内容"
+assert game.pv_moves, "已定局面应计算出分析箭头"
+assert game.pv_moves[0][:2] == game._cand_cache[0][:2], \
+    f"箭头与候选不一致: {game.pv_moves[0]} vs {game._cand_cache[0]}"
+
 root.destroy()
 print("GUI SMOKE OK")

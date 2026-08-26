@@ -88,6 +88,35 @@ def main():
     print(f"线长校验 OK;沿线狼正招数最大 {wc_max};"
           f"主选书重叠跳过 {n_skip};次选条目 {len(book2)}")
 
+    # 镜像补全:5x5 棋盘左右对称,次选书两侧都要有
+    def _mpos(p):
+        return (p // 5) * 5 + (4 - p % 5)
+
+    def _mstate(w, s):
+        mw = ms = 0
+        x = w
+        while x:
+            lsb = x & -x
+            mw |= 1 << _mpos(lsb.bit_length() - 1)
+            x ^= lsb
+        x = s
+        while x:
+            lsb = x & -x
+            ms |= 1 << _mpos(lsb.bit_length() - 1)
+            x ^= lsb
+        return mw, ms
+
+    added = 0
+    for (w2, s2), ms in list(book2.items()):
+        mw, mss = _mstate(w2, s2)
+        tgt = book2.setdefault((mw, mss), [])
+        for a, b in ms:
+            mmv = (_mpos(a), _mpos(b))
+            if mmv not in tgt:
+                tgt.append(mmv)
+                added += 1
+    print(f"次选书镜像补全: 新增 {added} 个走法,共 {len(book2)} 个局面")
+
     lines = [
         "# -*- coding: utf-8 -*-",
         '"""次选高压开局书(由 dfs_probe_report.txt / gen_book2.py 生成)。',

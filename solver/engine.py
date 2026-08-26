@@ -22,8 +22,22 @@ except Exception:
     OPENING_BOOK = {}
     OPENING_BOOK2 = {}
 
+try:
+    import parallel_score as _pscore
+except Exception:
+    class _PS:
+        @staticmethod
+        def batch_scores(items, depth, eng=None):
+            import winrate
+            return [winrate.score_position(w, s, t, eng=eng, depth=depth)[0]
+                    for w, s, t in items]
+    _pscore = _PS()
+
 INF = 1 << 30
 WIN_SCORE = 1000000
+CHAIN_W = 25       # 压力链每回合评分权重(表精确项)
+CHAIN_MAX = 8      # 压力链计入上限(更长的链收益趋平)
+_CHAIN_CACHE = {}  # 压力链缓存 (w,s) -> 链长
 
 
 class Engine:
@@ -35,11 +49,11 @@ class Engine:
         self.tt = {}      # alpha-beta 置换表 {key: (depth, score)}
         self.nodes = 0
         self.abort = False
-        self.trap_mode = False  # 羊方"陷阱模式":优先逼狼唯一安全应手
-        self.wolf_pressure = False  # 狼方"施压模式":和棋局面优先逼羊安全应手最少(保持三角等压迫阵)
         # 羊方开局轮换(防背谱):开局若干回合内,在和棋同档、评分接近的
         # 好棋中随机偏离主线——高手背不住所有变线,进入中盘才是羊的机会
         self.opening_variety = False
+        self.score_depth = 5   # 强手模型评分深度(精准度核心参数)
+        self._in_chain = False  # 压力链计算重入护栏
         self.opening_plies = 10
         self.score_margin = 12.0   # 评分相差该值以内视为同档可轮换
         self.rng = random.Random()
@@ -50,6 +64,52 @@ class Engine:
 
     def dist_of(self, w, s, turn):
         return endgame.lookup_dist(w, s, turn)
+
+    def _pressure_chain(self, w, s):
+        """压力链(表精确):从狼走后局面 (w,s)(和棋)起,沿主变线统计
+        狼连续"正招数<=2"的回合数。这是深度受限的失误模型看不到的
+        长线精度压力,由全破解表精确给出(压狼=逼狼每步只能走唯一正招,
+        走错即羊胜;链条越长,对手必须连续精确的时间越长)。"""
+        got = _CHAIN_CACHE.get((w, s))
+        if got is not None:
+            return got
+        if self._in_chain:
+            return 0
+        self._in_chain = True
+        try:
+            chain = 0
+            cw, cs, ct = w, s, WOLF
+            seen = set()
+            for _ in range(CHAIN_MAX * 2):
+                key = (cw, cs, ct)
+                if key in seen:
+                    break
+                seen.add(key)
+                if ct == WOLF:
+                    wc = 0
+                    for a, b, cap in wolf_moves(cw, cs):
+                        w2, s2 = apply_wolf_move(cw, cs, a, b)
+                        if popcount(s2) <= 3 or \
+                                endgame.lookup(w2, s2, SHEEP) == DRAW:
+                            wc += 1
+                    if wc > 2:
+                        break
+                    chain += 1
+                mv = self._choose_table_move(cw, cs, ct, fast=True,
+                                             no_chain=True)
+                if mv is None:
+                    break
+                if ct == WOLF:
+                    cw, cs = apply_wolf_move(cw, cs, mv[0], mv[1])
+                else:
+                    cw, cs = apply_sheep_move(cw, cs, mv[0], mv[1])
+                ct = 1 - ct
+        finally:
+            self._in_chain = False
+        if len(_CHAIN_CACHE) > 2_000_000:
+            _CHAIN_CACHE.clear()
+        _CHAIN_CACHE[(w, s)] = chain
+        return chain
 
     def covered(self, sheep_count):
         return sheep_count <= self.table_k
@@ -63,13 +123,16 @@ class Engine:
 
     # ---------- 最佳招法 ----------
     def best_move(self, w, s, turn, history=(), depth=None, max_len=None,
-                  ply_budget=None):
+                  ply_budget=None, score_depth=None, no_chain=False):
         """history: 本局已出现的 (wolves, sheep) 列表,用于重复回避
-        ply_budget: 剩余步数预算(150 步规则);必胜/必负所需步数超过预算时按和棋处理"""
+        ply_budget: 剩余步数预算(150 步规则);必胜/必负所需步数超过预算时按和棋处理
+        score_depth: 强手模型评分深度(None=引擎默认;迭代加深时逐层传入)
+        no_chain: True=跳过表精确压力链(界面快路径用;不影响结果档)"""
         t0 = time.time()
         if self.covered(popcount(s)):
             move, info = self._best_from_table(w, s, turn, history, max_len,
-                                               ply_budget)
+                                               ply_budget, score_depth,
+                                               no_chain)
         else:
             move, info = self._best_from_search(w, s, turn, history,
                                                 depth or self.search_depth)
@@ -332,15 +395,23 @@ class Engine:
                     caps += 1
         return caps
 
-    def _ranked_cands(self, w, s, turn, history, ply_budget, raw=False):
+    def _ranked_cands(self, w, s, turn, history, ply_budget, raw=False,
+                      score_depth=None, no_chain=False):
         """构建并按引擎规则排序全部候选招法(供 best_move 与变招功能共用)。
         raw=True 时不做限步修正,返回真实表值(界面显示用)。
+        score_depth: 强手模型评分深度(None=引擎默认)。
         【用户要求】限步规则只是终局条件,绝不参与选招:双方永远按真实
         表值走最优线(最快赢棋/最佳和棋)。羊胜限内杀不完时,羊仍走最快
         赢棋线——对方一旦失误,羊就能真的赢,不能自暴自弃改走拖延线。"""
+        sd = score_depth if score_depth is not None else self.score_depth
         cands = []
         hist_set = set(history) if history else set()
+        hist_cnt = {}
+        if history:
+            for h in history:
+                hist_cnt[h] = hist_cnt.get(h, 0) + 1
         if turn == WOLF:
+            wsc_items = []
             for frm, to, cap in wolf_moves(w, s):
                 w2, s2 = apply_wolf_move(w, s, frm, to)
                 k2 = popcount(s2)
@@ -350,6 +421,9 @@ class Engine:
                     v = endgame.lookup(w2, s2, SHEEP)
                     d = endgame.lookup_dist(w2, s2, SHEEP)
                 # 狼方:不应用限步修正,真实羊胜线一律避开
+                if v == DRAW and hist_cnt.get((w2, s2), 0) >= 4:
+                    # 重复规则:同一局面第5次出现=和棋判狼胜(狼的规则胜)
+                    v, d = WOLF_WIN, 0
                 if v == DRAW:
                     b, t = self._opp_err(w2, s2, SHEEP)
                     # 长线吃子潜力(用户:不无脑吃,要长线吃得更多)
@@ -358,47 +432,80 @@ class Engine:
                     inh = (w2, s2) in hist_set
                     # 重复压迫:走后羊只能重复或送子(用户思路)
                     zug = self._sheep_zugzwang(w2, s2, hist_set)
-                    err = (b, t, eat, inh, zug)
+                    # 强手模型评分(狼方:和棋也要尽量赢;评分稍后并行批量算)
+                    wsc_items.append((len(cands), w2, s2))
+                    err = (b, t, eat, inh, zug, 0.0)
                 else:
-                    err = (0, 0, 0, False, False)
+                    err = (0, 0, 0, False, False, 0.0)
                 cands.append((frm, to, cap, v, d, err))
+            if wsc_items:
+                scs = _pscore.batch_scores(
+                    [(w2, s2, SHEEP) for _, w2, s2 in wsc_items], sd,
+                    eng=self)
+                for (idx, _w2, _s2), scv in zip(wsc_items, scs):
+                    frm, to, cap, v, d, err = cands[idx]
+                    b, t, eat, inh, zug, _w = err
+                    cands[idx] = (frm, to, cap, v, d,
+                                  (b, t, eat, inh, zug, scv))
         else:
             ms = sheep_moves(w, s)
-            for allow_rep in (False, True):
-                out = []
-                for frm, to in ms:
-                    w2, s2 = apply_sheep_move(w, s, frm, to)
-                    if not allow_rep and (w2, s2) in hist_set:
-                        continue  # 直接重复=和棋=羊输,禁走(该羊变招,
-                        # 哪怕送子;狼不受此限)
-                    v = endgame.lookup(w2, s2, WOLF)
-                    d = endgame.lookup_dist(w2, s2, WOLF)
-                    # 羊方:同样不应用限步修正,永远走最快赢棋线
-                    if v == DRAW:
-                        b, t = self._opp_err(w2, s2, WOLF)
-                        # 重复回避(用户规则):和棋=羊负,该变招的是羊,狼可
-                        # 不变;且不给狼"一步走回历史"的来回重复机会
-                        rep = (w2, s2) in hist_set or \
-                            self._wolf_can_repeat(w2, s2, hist_set)
-                        safe = self._wolf_safe_caps(w2, s2)
-                        threat = self._wolf_cap_threat(w2, s2)
-                        # 软诱饵 = 狼吃后分数大跌;仅送子候选(safe>0)计算
-                        drop = self._bait_score_drop(w2, s2) \
-                            if safe > 0 else 0.0
-                        # 注:曾加过"堡垒倾向"键(8层堡垒检查),但该检查
-                        # 不可靠(16层会攻破假堡垒),已移除。
-                        import winrate as _wr
-                        sc = _wr.score_position(w2, s2, WOLF, eng=self,
-                                                depth=4)[0]
-                        err = (b, t, safe, drop, threat,
-                               self._wolf_losing_caps(w2, s2), rep,
-                               self._salient_err(w2, s2), sc, False)
-                    else:
-                        err = (0, 0, 0, 0.0, 0, 0, False, 0.0, 0.0, False)
-                    out.append((frm, to, False, v, d, err))
-                if out or not hist_set or allow_rep:
-                    cands.extend(out)
-                    break
+            all_c = []
+            sc_items = []
+            for frm, to in ms:
+                w2, s2 = apply_sheep_move(w, s, frm, to)
+                v = endgame.lookup(w2, s2, WOLF)
+                d = endgame.lookup_dist(w2, s2, WOLF)
+                # 重复规则(硬):走后狼若一步能走回"已出现4次"的局面
+                # (第5次=和棋判狼胜),该候选=规则负,视为狼胜避开。
+                if v == DRAW and hist_cnt:
+                    for wa, wb, cap in wolf_moves(w2, s2):
+                        w3, s3 = apply_wolf_move(w2, s2, wa, wb)
+                        if hist_cnt.get((w3, s3), 0) >= 4:
+                            v = WOLF_WIN
+                            d = 0
+                            break
+                # 羊方:同样不应用限步修正,永远走最快赢棋线
+                if v == DRAW:
+                    b, t = self._opp_err(w2, s2, WOLF)
+                    # 软重复键已废弃;硬规则=上方"走后狼一步走回第4次"
+                    # 与"羊走后第5次出现"两处检查。
+                    rep = False
+                    safe = self._wolf_safe_caps(w2, s2)
+                    threat = self._wolf_cap_threat(w2, s2)
+                    # 软诱饵 = 狼吃后分数大跌;仅送子候选(safe>0)计算
+                    drop = self._bait_score_drop(w2, s2) \
+                        if safe > 0 else 0.0
+                    # 注:曾加过"堡垒倾向"键(8层堡垒检查),但该检查
+                    # 不可靠(16层会攻破假堡垒),已移除。
+                    sc_items.append((len(all_c), w2, s2))
+                    err = (b, t, safe, drop, threat,
+                           self._wolf_losing_caps(w2, s2), rep,
+                           self._salient_err(w2, s2), 0.0,
+                           hist_cnt.get((w2, s2), 0))
+                else:
+                    err = (0, 0, 0, 0.0, 0, 0, False, 0.0, 0.0,
+                           hist_cnt.get((w2, s2), 0))
+                all_c.append((frm, to, False, v, d, err,
+                              hist_cnt.get((w2, s2), 0)))
+            if sc_items:
+                scs = _pscore.batch_scores(
+                    [(w2, s2, WOLF) for _, w2, s2 in sc_items], sd,
+                    eng=self)
+                for (idx, _w2, _s2), scv in zip(sc_items, scs):
+                    frm, to, cap, v, d, err, _cnt = all_c[idx]
+                    b, t, safe, drop, threat, poison, rep, salient, \
+                        _sc, repcnt = err
+                    all_c[idx] = (frm, to, cap, v, d,
+                                  (b, t, safe, drop, threat, poison, rep,
+                                   salient, scv, repcnt),
+                                  all_c[idx][6])
+            # 重复规则(用户确认):同一局面【第5次出现】才判和(羊负),
+            # 第2~4次重复完全合法——唯一和棋着法即使重复也必须走,
+            # 绝不能白送成真输(实战教训:game_vs_builtin_ai 第44手)。
+            keep = [c for c in all_c if c[6] < 4]
+            if not keep:
+                keep = list(all_c)   # 全部着法都会走到第5次:挑最不亏的
+            cands.extend([c[:6] for c in keep])
 
         # 排名:结果(越小越好) → [和棋:吃羊/骗招度] → 距离
         def key(c):
@@ -412,39 +519,40 @@ class Engine:
                 dk = 0
             if r == 1:
                 if turn == WOLF:
-                    bad, tot, eat, inh, zug = err
+                    bad, tot, eat, inh, zug, wsc = err
                     ratio = (bad / tot) if tot else 0.0
-                    if self.wolf_pressure:
-                        # 施压(实验):先吃羊,再逼"羊安全应手最少",再选骗招
-                        pref = (0 if cap else 1,
-                                tot - bad, -ratio)
-                    else:
-                        # 和棋(=到限狼胜):长线吃子潜力最大优先(不无脑吃);
-                        # 可走回历史局面优先(狼可重复不变招);其次制造
-                        # "羊只能重复或送子"的重复压迫;同潜力时先吃,再选骗招
-                        pref = (-eat, -inh, -zug, 0 if cap else 1, -ratio)
+                    # 和棋(=到限狼胜)但也要尽量赢(用户要求):
+                    # 羊正招极少(压力) → 长线吃子潜力 → 强手模型评分
+                    # → 走回历史 → 重复压迫 → 先吃 → 骗招
+                    scorr = tot - bad      # 走后羊的正招数(越少越好)
+                    pref = (scorr, -eat, -wsc, -inh, -zug,
+                            0 if cap else 1, -ratio)
                 else:
                     bad, tot, safe, drop, threat, poison, rep, salient, sc, \
-                        fort = err
-                    if self.trap_mode:
-                        # 陷阱模式(实验):优先"狼安全应手最少"(逼唯一应手)
-                        pref = (tot - bad, -salient)
+                        repcnt = err
+                    # 羊方定稿(实战数据:人类高手=不送子+狼唯一正招
+                    # 同时成立;本局引擎送子12处且压力第26手崩掉):
+                    # 开局书 → 不送子 → 狼正招极少 → 狼吃不到
+                    # → 模型评分 → 重复次数少 → 软诱饵 → 败招多
+                    # → 显眼败招 → 毒羊
+                    bm = OPENING_BOOK.get((w, s))
+                    bm2 = OPENING_BOOK2.get((w, s))
+                    if bm and (frm, to) in bm:
+                        bk = 0      # 主选高压(狼唯一正招)
+                    elif bm2 and (frm, to) in bm2:
+                        bk = 1      # 次选高压(狼正招<=2)
                     else:
-                        # 和棋(=到限羊输):不走进重复陷阱 → 高压走廊开局书
-                        # → 不送子(送子时优先软诱饵) → 狼正招极少(中局精度
-                        # 压力:实测93%中局可压到唯一正招) → 狼吃不到 →
-                        # 模型评分 → 败招多 → 显眼败招 → 毒羊
-                        bm = OPENING_BOOK.get((w, s))
-                        bm2 = OPENING_BOOK2.get((w, s))
-                        if bm and (frm, to) in bm:
-                            bk = 0      # 主选高压(狼唯一正招)
-                        elif bm2 and (frm, to) in bm2:
-                            bk = 1      # 次选高压(狼正招<=2)
-                        else:
-                            bk = 2
-                        wcorr = tot - bad   # 狼走后仍和棋的正招数
-                        pref = (rep, bk, safe, wcorr, -drop, threat, sc,
-                                -bad, -salient, -poison)
+                        bk = 2
+                    wcorr = tot - bad   # 狼走后仍和棋的正招数
+                    # 模型评分 + 表精确压力链(深度受限的模型看不到的
+                    # 长线精度压力,由表精确补上);no_chain=界面快路径跳过
+                    sc_adj = sc
+                    if not no_chain and not self._in_chain:
+                        w2k, s2k = apply_sheep_move(w, s, frm, to)
+                        ch = self._pressure_chain(w2k, s2k)
+                        sc_adj = sc - CHAIN_W * min(ch, CHAIN_MAX)
+                    pref = (bk, safe, wcorr, threat, sc_adj, repcnt, -drop,
+                            -bad, -salient, -poison)
             else:
                 pref = ()
             return (r,) + pref + (dk, to, frm)
@@ -453,12 +561,14 @@ class Engine:
         return cands
 
     def ranked_moves(self, w, s, turn, history=(), ply_budget=None,
-                     all_ranks=False, raw=False):
+                     all_ranks=False, raw=False, score_depth=None,
+                     no_chain=False):
         """按引擎排序的候选招法 [(frm,to,cap), v, d]。
         all_ranks=False: 仅最优结果档(GUI"变招"用,绝不降档);
         all_ranks=True : 全部招法从优到次(GUI"候选招法"面板用);
         raw=True       : 不做限步修正,返回真实表值(界面显示用)。"""
-        cands = self._ranked_cands(w, s, turn, history, ply_budget, raw=raw)
+        cands = self._ranked_cands(w, s, turn, history, ply_budget, raw=raw,
+                                   score_depth=score_depth, no_chain=no_chain)
         if not cands:
             return []
         if not all_ranks:
@@ -527,8 +637,10 @@ class Engine:
         return (first[1], first[2], first[3]), chain_best, desc
 
     def _best_from_table(self, w, s, turn, history, max_len=None,
-                         ply_budget=None):
-        cands = self._ranked_cands(w, s, turn, history, ply_budget)
+                         ply_budget=None, score_depth=None, no_chain=False):
+        cands = self._ranked_cands(w, s, turn, history, ply_budget,
+                                   score_depth=score_depth,
+                                   no_chain=no_chain)
         if not cands:
             return None, dict(value=ONGOING, dist=-1, n=0, table=True)
         # 高压走廊开局书:羊方在书内局面时,只在书内走法间轮换(防背谱);
@@ -587,10 +699,12 @@ class Engine:
                     pv=self.pv(w, s, turn, max_len))
         return (frm, to, cap), info
 
-    def _choose_table_move(self, w, s, turn, fast=False):
+    def _choose_table_move(self, w, s, turn, fast=False, no_chain=False,
+                           score_depth=None):
         """仅选出表最优招法(不含 PV),供 pv() 使用,避免递归。
         fast=True 时跳过模型评分/软诱饵计算(内部调用与胜率估计用,
         避免递归变慢;真实选招走 _ranked_cands 全量评分)。"""
+        sd = score_depth if score_depth is not None else self.score_depth
         hist = set()
         if turn == WOLF:
             cands = []
@@ -598,16 +712,21 @@ class Engine:
                 w2, s2 = apply_wolf_move(w, s, frm, to)
                 if popcount(s2) <= 3:
                     v, d = WOLF_WIN, 0
-                    err = (0, 0, 0, False, False)
+                    err = (0, 0, 0, False, False, 0.0)
                 else:
                     v = endgame.lookup(w2, s2, SHEEP)
                     d = endgame.lookup_dist(w2, s2, SHEEP)
                     if v == DRAW:
                         b, t = self._opp_err(w2, s2, SHEEP)
                         eat = self._wolf_eat_potential(w2, s2)
-                        err = (b, t, eat, False, False)
+                        wsc = 0.0
+                        if not fast:
+                            import winrate as _wr
+                            wsc = _wr.score_position(w2, s2, SHEEP,
+                                                     eng=self, depth=sd)[0]
+                        err = (b, t, eat, False, False, wsc)
                     else:
-                        err = (0, 0, 0, False, False)
+                        err = (0, 0, 0, False, False, 0.0)
                 cands.append((frm, to, cap, v, d, err))
         else:
             cands = []
@@ -625,12 +744,12 @@ class Engine:
                     if not fast:
                         import winrate as _wr
                         sc = _wr.score_position(w2, s2, WOLF, eng=self,
-                                                depth=4)[0]
+                                                depth=sd)[0]
                     err = (b, t, safe, drop, threat,
                            self._wolf_losing_caps(w2, s2), False,
-                           self._salient_err(w2, s2), sc, False)
+                           self._salient_err(w2, s2), sc, 0)
                 else:
-                    err = (0, 0, 0, 0.0, 0, 0, False, 0.0, 0.0, False)
+                    err = (0, 0, 0, 0.0, 0, 0, False, 0.0, 0.0, 0)
                 cands.append((frm, to, False, v, d, err))
         def key(c):
             frm, to, cap, v, d, err = c
@@ -643,34 +762,33 @@ class Engine:
                 dk = 0
             if r == 1:
                 if turn == WOLF:
-                    bad, tot, eat, inh, zug = err
+                    bad, tot, eat, inh, zug, wsc = err
                     ratio = (bad / tot) if tot else 0.0
-                    if self.wolf_pressure:
-                        # 施压(实验):先吃羊,再逼"羊安全应手最少"
-                        pref = (0 if cap else 1, tot - bad, -ratio)
-                    else:
-                        # 和棋且狼走:长线吃子潜力最大优先,同潜力时先吃
-                        pref = (-eat, -inh, -zug, 0 if cap else 1, -ratio)
+                    # 与 _ranked_cands 同键(hist 恒为空,inh/zug 恒 False)
+                    scorr = tot - bad
+                    pref = (scorr, -eat, -wsc, -inh, -zug,
+                            0 if cap else 1, -ratio)
                 else:
                     bad, tot, safe, drop, threat, poison, rep, salient, sc, \
-                        fort = err
-                    if self.trap_mode:
-                        # 陷阱模式(实验):优先"狼安全应手最少"
-                        pref = (tot - bad, -salient)
+                        repcnt = err
+                    # 和棋且羊走:与 _ranked_cands 同键(定稿)
+                    # (hist 恒为空,rep/repcnt 恒 0/False)
+                    bm = OPENING_BOOK.get((w, s))
+                    bm2 = OPENING_BOOK2.get((w, s))
+                    if bm and (frm, to) in bm:
+                        bk = 0
+                    elif bm2 and (frm, to) in bm2:
+                        bk = 1
                     else:
-                        # 和棋且羊走:与 _ranked_cands 同键
-                        # (hist 恒为空,rep 恒 False,与 best_move(history=()) 一致)
-                        bm = OPENING_BOOK.get((w, s))
-                        bm2 = OPENING_BOOK2.get((w, s))
-                        if bm and (frm, to) in bm:
-                            bk = 0
-                        elif bm2 and (frm, to) in bm2:
-                            bk = 1
-                        else:
-                            bk = 2
-                        wcorr = tot - bad
-                        pref = (rep, bk, safe, wcorr, -drop, threat, sc,
-                                -bad, -salient, -poison)
+                        bk = 2
+                    wcorr = tot - bad
+                    sc_adj = sc
+                    if not no_chain and not fast:
+                        w2k, s2k = apply_sheep_move(w, s, frm, to)
+                        ch = self._pressure_chain(w2k, s2k)
+                        sc_adj = sc - CHAIN_W * min(ch, CHAIN_MAX)
+                    pref = (bk, safe, wcorr, threat, sc_adj, repcnt, -drop,
+                            -bad, -salient, -poison)
             else:
                 pref = ()
             return (r,) + pref + (dk, to, frm)

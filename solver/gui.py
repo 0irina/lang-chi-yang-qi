@@ -79,6 +79,7 @@ class Game:
         self.notation = []              # 棋谱(每步文字)
         self._cand_cache = []           # 候选招法面板缓存 [(frm,to,cap),...]
         self._book_cache = []           # 开局库面板缓存 [(frm,to,cap),...]
+        self._press_cache = []          # 高压招法面板缓存 [(frm,to,cap),...]
         self.hover_mv = None            # 悬停预览的招法(黄色箭头)
         self._hover_widget = None       # 当前悬停高亮的列表控件
         self._hover_index = None        # 当前悬停高亮的行号
@@ -195,7 +196,7 @@ class Game:
         side.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         side.columnconfigure(0, weight=1)
         side.rowconfigure(1, weight=1)
-        side.rowconfigure(5, weight=1)
+        side.rowconfigure(7, weight=1)
 
         hist_head = tk.Frame(side, bg=BG)
         hist_head.grid(row=0, column=0, sticky='ew', pady=(0, 2))
@@ -246,11 +247,32 @@ class Game:
         self.book_list.bind('<Motion>', self.on_book_hover)
         self.book_list.bind('<Leave>', lambda e: self._clear_hover())
 
+        tk.Label(side, text="高压招法 · 走后对方唯一正招(狼羊通用)",
+                 font=('Microsoft YaHei UI', 11, 'bold'), fg='#F2C94C', bg=BG).grid(
+            row=4, column=0, sticky='w', pady=(0, 2))
+        press_f = tk.Frame(side, bg=BG)
+        press_f.grid(row=5, column=0, sticky='ew', pady=(0, 6))
+        press_f.columnconfigure(0, weight=1)
+        self.press_list = tk.Listbox(press_f, font=('Consolas', 11), width=36,
+                                     height=4, bg=PANEL, fg=PANEL_FG,
+                                     selectbackground=ACCENT,
+                                     selectforeground='#FFFFFF',
+                                     relief='flat', highlightthickness=0,
+                                     activestyle='none', exportselection=False)
+        self.press_list.grid(row=0, column=0, sticky='ew')
+        psb = tk.Scrollbar(press_f, orient='vertical',
+                           command=self.press_list.yview)
+        psb.grid(row=0, column=1, sticky='ns')
+        self.press_list.config(yscrollcommand=psb.set)
+        self.press_list.bind('<Button-1>', self.on_press_click)
+        self.press_list.bind('<Motion>', self.on_press_hover)
+        self.press_list.bind('<Leave>', lambda e: self._clear_hover())
+
         tk.Label(side, text="候选招法 · 玩家回合点选即走",
                  font=('Microsoft YaHei UI', 11, 'bold'), fg=SUB_FG, bg=BG).grid(
-            row=4, column=0, sticky='w', pady=(0, 2))
+            row=6, column=0, sticky='w', pady=(0, 2))
         cand_f = tk.Frame(side, bg=BG)
-        cand_f.grid(row=5, column=0, sticky='nsew')
+        cand_f.grid(row=7, column=0, sticky='nsew')
         cand_f.rowconfigure(0, weight=1)
         cand_f.columnconfigure(0, weight=1)
         self.cand_list = tk.Listbox(cand_f, font=('Consolas', 11), width=36,
@@ -425,7 +447,8 @@ class Game:
         except (ValueError, tk.TclError):
             pass
 
-    def _pv_moves(self, w, s, turn, n=2, history=()):
+    def _pv_moves(self, w, s, turn, n=2, history=(), score_depth=4,
+                  no_chain=True):
         """从局面 (w,s,turn) 出发的主变线:当前方最佳 -> 对方最佳应对 -> ...
         与 best_move 同一套选招(含重复回避),保证与"最佳"一致。"""
         pv = []
@@ -437,8 +460,9 @@ class Game:
                 if turn == WOLF:
                     if not wolf_moves(w, s):
                         break
-                    mv, _ = self.engine.best_move(w, s, WOLF, history=history,
-                                                  ply_budget=budget)
+                    mv, _ = self.engine.best_move(
+                        w, s, WOLF, history=history, ply_budget=budget,
+                        score_depth=score_depth, no_chain=no_chain)
                     if not mv or mv[0] is None:
                         break
                     frm, to, cap = mv
@@ -446,8 +470,9 @@ class Game:
                 else:
                     if not sheep_moves(w, s):
                         break
-                    mv, _ = self.engine.best_move(w, s, SHEEP, history=history,
-                                                  ply_budget=budget)
+                    mv, _ = self.engine.best_move(
+                        w, s, SHEEP, history=history, ply_budget=budget,
+                        score_depth=score_depth, no_chain=no_chain)
                     if not mv or mv[0] is None:
                         break
                     frm, to, cap = mv
@@ -510,9 +535,12 @@ class Game:
             self.update_display()
 
     def analysis_worker(self):
-        """常驻线程:AI 执子或手动开分析时,自动计算主变线箭头链与文字分析。
-        只在局面变化时重算,避免闪烁与空转。"""
+        """常驻线程:象棋引擎式迭代加深——同一局面下深度逐层加深
+        (4→10),评分与最佳招法实时刷新;每局面总预算90秒(深深度
+        指数变慢,超时停在当前深度);局面变化或已定局面即停止/重算。"""
         import time
+        DEPTHS = (4, 5, 6, 8)
+        BUDGET = 60.0
         while True:
             try:
                 if self.game_over or not self.analysis_on() or self.editing:
@@ -525,53 +553,67 @@ class Game:
                 self._last_analy_key = key
                 turn = (key[2] + self.turn_bias) % 2
                 budget = self.move_limit - key[2]
-                mv, info = self.engine.best_move(key[0], key[1], turn,
-                                                 self.pos_history,
-                                                 max_len=10,
-                                                 ply_budget=budget)
-                # 主变线长度:必胜/必负走完整条线(到终局),和棋走10步
                 vv0 = endgame.lookup(key[0], key[1], turn)
                 dd0 = endgame.lookup_dist(key[0], key[1], turn)
-                if vv0 in (WOLF_WIN, SHEEP_WIN) and dd0 and dd0 > 0:
-                    n_pv = min(dd0 + 4, 400)
-                else:
-                    n_pv = 10
-                pv = self._pv_moves(key[0], key[1], turn,
-                                    n=n_pv, history=self.pos_history)
-                var_n = self.variant_override
-                if var_n and var_n > 0:
-                    # 分析模式:显示第 var_n 档变招(仅显示,不改棋盘)
-                    choices = self._get_variant_choices(key[0], key[1], turn)
-                    if choices:
-                        i = var_n % len(choices)
-                        (frm, to, cap), vv, dd = choices[i]
-                        if turn == WOLF:
-                            wv, sv = apply_wolf_move(key[0], key[1], frm, to)
-                        else:
-                            wv, sv = apply_sheep_move(key[0], key[1], frm, to)
-                        n_v = (min(dd + 2, 400)
-                               if vv in (WOLF_WIN, SHEEP_WIN) else 10)
-                        pv = [(frm, to, cap)] + self._pv_moves(
-                            wv, sv, 1 - turn, history=self.pos_history,
-                            n=n_v)
-                        mv, info = (frm, to, cap), dict(value=vv, dist=dd)
-                self.root.after(0, lambda vn=var_n, k=key: self._set_analysis(
-                    k, turn, mv, info, pv, vn))
+                decided = vv0 in (WOLF_WIN, SHEEP_WIN)
+                n_pv = (min(dd0 + 4, 400)
+                        if decided and dd0 and dd0 > 0 else 10)
+                t_start = time.time()
+                for dep in DEPTHS:
+                    if (self.wolves, self.sheep, self.move_count) != key:
+                        break
+                    if time.time() - t_start > BUDGET:
+                        break   # 单局面总预算,防止深深度拖太久
+                    mv, info = self.engine.best_move(
+                        key[0], key[1], turn, self.pos_history,
+                        max_len=10, ply_budget=budget, score_depth=dep)
+                    pv = self._pv_moves(key[0], key[1], turn,
+                                        n=n_pv, history=self.pos_history,
+                                        score_depth=dep)
+                    var_n = self.variant_override
+                    if var_n and var_n > 0 and not decided:
+                        # 变招仅在和棋局面有意义(已定局面显示最快胜着)
+                        choices = self._get_variant_choices(key[0], key[1],
+                                                            turn)
+                        if choices:
+                            i = var_n % len(choices)
+                            (frm, to, cap), vv, dd = choices[i]
+                            if turn == WOLF:
+                                wv, sv = apply_wolf_move(key[0], key[1],
+                                                         frm, to)
+                            else:
+                                wv, sv = apply_sheep_move(key[0], key[1],
+                                                          frm, to)
+                            n_v = (min(dd + 2, 400)
+                                   if vv in (WOLF_WIN, SHEEP_WIN) else 10)
+                            pv = [(frm, to, cap)] + self._pv_moves(
+                                wv, sv, 1 - turn, history=self.pos_history,
+                                n=n_v, score_depth=dep)
+                            mv, info = (frm, to, cap), dict(value=vv, dist=dd)
+                    self.root.after(0, lambda k=key, t=turn, m=mv, i2=info,
+                                    p=pv, vn=var_n, d=dep:
+                                    self._set_analysis(k, t, m, i2, p, vn, d))
+                    if decided:
+                        break   # 已定局面:表值精确,无需更深
+                    time.sleep(0.05)
             except RuntimeError:
                 break  # 窗口已关闭
             except Exception as e:
                 print(f"分析出错: {e}")
             time.sleep(1.0)
 
-    def _set_analysis(self, key, turn, mv, info, pv, variant_n=None):
+    def _set_analysis(self, key, turn, mv, info, pv, variant_n=None,
+                      depth=0):
         # 竞态防护:局面已变化(走了新棋/悔棋/浏览)则丢弃过期分析结果
         if key != self._last_analy_key:
             return
         self.pv_moves = pv or []
-        self.update_analysis_text(key, turn, mv, info, self.pv_moves, variant_n)
+        self.update_analysis_text(key, turn, mv, info, self.pv_moves,
+                                  variant_n, depth)
         self.update_display()
 
-    def update_analysis_text(self, key, turn, mv, info, pv, variant_n=None):
+    def update_analysis_text(self, key, turn, mv, info, pv, variant_n=None,
+                             depth=0):
         self.text.config(state=tk.NORMAL)
         self.text.delete('1.0', tk.END)
         k = popcount(key[1])
@@ -584,7 +626,7 @@ class Game:
         if not (self.ai_wolf and self.ai_sheep):
             try:
                 sc, pw, ps2, pd2 = winrate.score_position(
-                    key[0], key[1], turn, eng=self.engine, depth=6)
+                    key[0], key[1], turn, eng=self.engine, depth=4)
                 if v == WOLF_WIN or v == SHEEP_WIN:
                     d0 = endgame.lookup_dist(key[0], key[1], turn)
                     tag = (f"狼胜,{d0}步内" if v == WOLF_WIN
@@ -608,7 +650,8 @@ class Game:
             who = "狼" if turn == WOLF else "羊"
             tag = "吃!" if cap else ""
             head = f"变招{variant_n}" if variant_n else "最佳"
-            self.text.insert(tk.END, f"{head}: {who} {pos_name(frm)}→{pos_name(to)} {tag}\n")
+            dtxt = f"(深度{depth})" if depth else ""
+            self.text.insert(tk.END, f"{head}: {who} {pos_name(frm)}→{pos_name(to)} {tag} {dtxt}\n")
             rv = info.get("raw_value", info.get("value"))
             d0 = info.get("raw_dist", info.get("dist"))
             if rv in (WOLF_WIN, SHEEP_WIN):
@@ -786,6 +829,11 @@ class Game:
             self.game_over = True
             self.status_label.config(text="狼被围死,羊获胜!")
             messagebox.showinfo("游戏结束", "羊获胜!")
+        elif self.pos_history.count((self.wolves, self.sheep)) >= 5:
+            self.game_over = True
+            self.status_label.config(
+                text="同一局面第5次出现,和棋判狼胜!")
+            messagebox.showinfo("游戏结束", "同一局面第5次出现:和棋判狼胜!")
         elif self.move_count >= self.move_limit:
             self.game_over = True
             self.status_label.config(
@@ -942,7 +990,8 @@ class Game:
         if key != self._variant_key or not self.variant_choices:
             budget = self.move_limit - self.move_count
             self.variant_choices = self.engine.ranked_moves(
-                w, s, turn, self.pos_history, ply_budget=budget)
+                w, s, turn, self.pos_history, ply_budget=budget,
+                score_depth=4, no_chain=True)
             self._variant_key = key
         return self.variant_choices
 
@@ -1010,12 +1059,14 @@ class Game:
             budget = self.move_limit - self.move_count
             mv, info = self.engine.best_move(key[0], key[1], turn,
                                              self.pos_history, max_len=10,
-                                             ply_budget=budget)
+                                             ply_budget=budget,
+                                             score_depth=4, no_chain=True)
             pv = self._pv_moves(key[0], key[1], turn,
-                                history=self.pos_history)
+                                history=self.pos_history, score_depth=4,
+                                no_chain=True)
             self._last_analy_key = key      # 即时预览通过竞态校验
             self._set_analysis(key, turn, mv, info, pv)
-            self._last_analy_key = None     # 让后台线程用完整逻辑重算
+            self._last_analy_key = None     # 让后台线程用迭代加深重算
         except Exception as e:
             print(f"即时分析失败: {e}")
 
@@ -1035,12 +1086,15 @@ class Game:
         if self.game_over or self.editing:
             self.book_list.insert(tk.END, "— 当前局面不在开局库 —")
             self.book_list.itemconfig(0, fg='#5A6B80')
+            self.press_list.insert(tk.END, "— 无走后唯一正招的着法 —")
+            self.press_list.itemconfig(0, fg='#5A6B80')
             return
         try:
             turn = self.cur_turn()
             moves = self.engine.ranked_moves(
                 self.wolves, self.sheep, turn, self.pos_history,
-                ply_budget=self.move_limit - self.move_count, raw=True)
+                ply_budget=self.move_limit - self.move_count, raw=True,
+                score_depth=4, no_chain=True)
         except Exception as e:
             print(f"候选面板出错: {e}")
             moves = []
@@ -1079,6 +1133,30 @@ class Game:
         if bmsg is not None:
             self.book_list.insert(tk.END, bmsg)
             self.book_list.itemconfig(0, fg='#5A6B80')
+        # 高压招法面板(狼羊通用):走后对方只剩唯一不败着法的着法
+        self.press_list.delete(0, tk.END)
+        self._press_cache = []
+        pmsg = "— 无走后唯一正招的着法 —"
+        try:
+            if not self.game_over and not self.editing:
+                turn = self.cur_turn()
+                press = self._unique_reply_moves(self.wolves, self.sheep,
+                                                 turn)
+                if press:
+                    pmsg = None
+                    nm = "狼" if turn == WOLF else "羊"
+                    for (a, b, cap) in press:
+                        self.press_list.insert(
+                            tk.END,
+                            f"{nm} {pos_name(a)}→{pos_name(b)}"
+                            f"{'吃' if cap else ''} · 对方唯一正招")
+                        self.press_list.itemconfig(tk.END, fg='#F2C94C')
+                        self._press_cache.append((a, b, cap))
+        except Exception:
+            pass
+        if pmsg is not None:
+            self.press_list.insert(tk.END, pmsg)
+            self.press_list.itemconfig(0, fg='#5A6B80')
         # 同步刷新分析文字/箭头,保证与候选面板一致(消除时间差错位)
         self._refresh_analysis_now()
 
@@ -1134,6 +1212,74 @@ class Game:
             return
         self._hover_row(self.book_list, i)
         self.hover_mv = self._book_cache[i]
+        self.update_display()
+
+    def _unique_reply_moves(self, w, s, turn):
+        """当前方走后,对方恰好只剩唯一不败着法的着法列表(狼羊通用)。"""
+        out = []
+        if turn == WOLF:
+            for a, b, cap in wolf_moves(w, s):
+                w2, s2 = apply_wolf_move(w, s, a, b)
+                if popcount(s2) <= 3:
+                    continue
+                if endgame.lookup(w2, s2, SHEEP) != DRAW:
+                    continue
+                n = 0
+                for sa, sb in sheep_moves(w2, s2):
+                    w3, s3 = apply_sheep_move(w2, s2, sa, sb)
+                    if endgame.lookup(w3, s3, WOLF) != WOLF_WIN:
+                        n += 1
+                if n == 1:
+                    out.append((a, b, cap))
+        else:
+            for a, b in sheep_moves(w, s):
+                w2, s2 = apply_sheep_move(w, s, a, b)
+                if endgame.lookup(w2, s2, WOLF) != DRAW:
+                    continue
+                n = 0
+                for wa, wb, cap in wolf_moves(w2, s2):
+                    w3, s3 = apply_wolf_move(w2, s2, wa, wb)
+                    if popcount(s3) <= 3 or \
+                            endgame.lookup(w3, s3, SHEEP) == DRAW:
+                        n += 1
+                if n == 1:
+                    out.append((a, b, False))
+        return out
+
+    def on_press_click(self, ev):
+        """高压招法面板点选:人类回合可直接走该着法(AI回合仅查看)"""
+        if self.game_over or self.editing or self.ai_thinking:
+            return
+        i = self.press_list.index(f"@{ev.x},{ev.y}")
+        if i is None:
+            return
+        try:
+            i = int(i)
+        except ValueError:
+            return
+        turn = self.cur_turn()
+        if (turn == WOLF and self.ai_wolf) or (turn == SHEEP and self.ai_sheep):
+            return
+        if 0 <= i < len(self._press_cache):
+            frm, to, cap = self._press_cache[i]
+            if turn == WOLF:
+                self.try_move_wolf(frm, to)
+            else:
+                self.try_move_sheep(frm, to)
+
+    def on_press_hover(self, ev):
+        """高压招法面板悬停:高亮该行并在棋盘画黄色预览箭头"""
+        i = self.press_list.index(f"@{ev.x},{ev.y}")
+        if i is None:
+            return
+        try:
+            i = int(i)
+        except ValueError:
+            return
+        if not (0 <= i < len(self._press_cache)):
+            return
+        self._hover_row(self.press_list, i)
+        self.hover_mv = self._press_cache[i]
         self.update_display()
 
     def _hover_row(self, widget, i):
@@ -1440,9 +1586,20 @@ class Game:
             idxs = list(range(min(2, len(self.pv_moves))))
             if self.hover_mv is not None and 0 in idxs:
                 idxs.remove(0)
+            # 第一支箭头必须与候选面板第一手一致(面板=当前局面的同步
+            # 最优);分析数据若过期(异步竞态/浏览)自动纠正。变招模式下
+            # 才允许显示第N档变招箭头。
+            use_panel = ((self.variant_override or 0) == 0
+                         and bool(self._cand_cache))
             for i in idxs:
-                self._draw_arrow(self.pv_moves[i][0], self.pv_moves[i][1],
-                                 colors[i], width=6 if i == 0 else 5)
+                if i == 0 and use_panel:
+                    mv = self._cand_cache[0]
+                else:
+                    mv = self.pv_moves[i]
+                if mv is None:
+                    continue
+                self._draw_arrow(mv[0], mv[1], colors[i],
+                                 width=6 if i == 0 else 5)
         # 悬停预览箭头(金黄色)
         if self.hover_mv is not None and not self.game_over:
             self._draw_arrow(self.hover_mv[0], self.hover_mv[1], '#F5C518',
@@ -1477,6 +1634,14 @@ class Game:
 if __name__ == "__main__":
     import sys
 
+    import multiprocessing
+    multiprocessing.freeze_support()
+    try:
+        import parallel_score
+        parallel_score.enable()
+    except Exception:
+        pass
+
     ttdir0 = endgame.default_outdir()
 
     if "--unpack-only" in sys.argv:
@@ -1498,6 +1663,20 @@ if __name__ == "__main__":
             ok = (v0 == WOLF_WIN and mv is not None and mv[0] is not None
                   and info["value"] == WOLF_WIN)
         print("selftest:", "OK" if ok else f"FAIL v0={v0} mv={mv}")
+        # 多核并行评分自检:走3手到多候选局面,触发批量并行
+        try:
+            import parallel_score
+            parallel_score.enable()
+            w2, s2 = apply_wolf_move(INIT_WOLVES, INIT_SHEEP, 2, 12)
+            w3, s3 = apply_sheep_move(w2, s2, 11, 6)
+            w4, s4 = apply_wolf_move(w3, s3, 3, 13)
+            mv2, info2 = eng.best_move(w4, s4, SHEEP, history=(),
+                                       score_depth=5)
+            par = parallel_score.is_parallel_active()
+            print("parallel selftest:", "OK" if mv2 else "FAIL",
+                  "| 多核池:", "已启用" if par else "未启用(串行回退)")
+        except Exception as e:
+            print("parallel selftest: FAIL", e)
         sys.exit(0 if ok else 1)
 
     # 首次运行:自动解压 .zst 数据表(仅打包版分发用)
